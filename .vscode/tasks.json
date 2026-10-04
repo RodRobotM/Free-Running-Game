@@ -1,0 +1,28 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Configurar CMake",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["-S", ".", "-B", "build"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Compilar esfera",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "build", "--config", "Release"],
+            "dependsOn": "Configurar CMake",
+            "group": "build",
+            "problemMatcher": ["$msCompile"]
+        },
+        {
+            "label": "Ejecutar esfera",
+            "type": "shell",
+            "command": "& .\\build\\Release\\clickable_sphere.exe",
+            "dependsOn": "Compilar esfera",
+            "problemMatcher": []
+        }
+    ]
+}
