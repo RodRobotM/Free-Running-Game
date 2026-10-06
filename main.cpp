@@ -32,9 +32,9 @@ constexpr int CONTROL_HEIGHT = 82;
 constexpr int MIN_EYE_DISTANCE = 20;
 constexpr int MAX_EYE_DISTANCE = 700;
 constexpr int DEFAULT_EYE_DISTANCE = 180;
-constexpr double MOVE_SPEED = 7.0;
-constexpr double JUMP_SPEED = 8.5;
-constexpr double GRAVITY = 22.0;
+constexpr double STANDARD_GRAVITY = 9.80665;
+constexpr double FORCE_APPLICATION_TIME = 0.18;
+constexpr double IMPACT_TIME = 0.18;
 constexpr double PLATFORM_SIZE = 4.0;
 constexpr int BUTTON_RESUME = 2001;
 constexpr int BUTTON_RESTART = 2002;
@@ -43,6 +43,7 @@ constexpr int BUTTON_MAP = 3001;
 constexpr int BUTTON_GRAPHICS = 3002;
 constexpr int BUTTON_PLAYER = 3003;
 constexpr int BUTTON_FLIPS = 3004;
+constexpr int BUTTON_PHYSICS = 3005;
 constexpr int BUTTON_BACK = 3099;
 constexpr int BUTTON_POINT_LIGHT = 3210;
 constexpr int BUTTON_SHOW_FPS = 3220;
@@ -56,11 +57,22 @@ POINT lastMouse{};
 bool dragging = false;
 bool paused = false;
 bool keyState[256]{};
+bool grounded = true;
 double playerX = 0.0;
 double playerY = 4.0;
 double playerZ = 0.0;
 double playerHeight = 1.74;
+double velocityX = 0.0;
+double velocityZ = 0.0;
 double verticalSpeed = 0.0;
+double configuredAcceleration = 12.0;
+double playerMass = 70.0;
+double jumpForce = 120.0;
+double receptionCapacity = 250.0;
+double configuredGravity = STANDARD_GRAVITY;
+double stopAcceleration = 18.0;
+bool fallen = false;
+double fallElapsed = 0.0;
 double worldTime = 0.0;
 int menuPage = 0;
 int mapRadius = 3;
@@ -74,7 +86,6 @@ bool showFps = false;
 int fpsLimit = 60;
 int fieldOfView = 60;
 int configuredMoveSpeed = 7;
-int configuredJump = 9;
 double mortalSpeed = 0.8;
 double twistSpeed = 0.8;
 enum class FlipKind { None, Front, Back, TwistLeft, TwistRight, SideLeft, SideRight };
@@ -104,6 +115,7 @@ HWND mapButton = nullptr;
 HWND graphicsButton = nullptr;
 HWND playerButton = nullptr;
 HWND flipsButton = nullptr;
+HWND physicsButton = nullptr;
 HWND backButton = nullptr;
 HWND pointLightButton = nullptr;
 HWND showFpsButton = nullptr;
@@ -114,8 +126,7 @@ struct MenuOption {
     int minusId;
     int plusId;
     HWND label;
-    HWND minusButton;
-    HWND plusButton;
+    HWND slider;
 };
 std::vector<MenuOption> menuOptions;
 
@@ -130,7 +141,12 @@ void resetGame() {
     playerX = 0.0;
     playerY = 0.35 + playerHeight * 0.5;
     playerZ = 0.0;
+    velocityX = 0.0;
+    velocityZ = 0.0;
     verticalSpeed = 0.0;
+    grounded = true;
+    fallen = false;
+    fallElapsed = 0.0;
     rotationX = 0.0;
     rotationY = 0.0;
     worldTime = 0.0;
@@ -171,7 +187,9 @@ void startFlip(FlipKind kind) {
         double speed = kind == FlipKind::TwistLeft || kind == FlipKind::TwistRight
             ? twistSpeed : mortalSpeed;
         flipDuration = 1.0 / speed;
-        verticalSpeed = std::max(verticalSpeed, JUMP_SPEED * 0.7);
+        verticalSpeed = std::max(verticalSpeed,
+            jumpForce * 9.80665 / std::max(1.0, playerMass) * FORCE_APPLICATION_TIME);
+        grounded = false;
     }
     activeFlipMask |= flipMask(kind);
 }
@@ -203,22 +221,53 @@ void updateGame(double deltaSeconds) {
         return;
     }
 
+    if (fallen) {
+        fallElapsed += deltaSeconds;
+        velocityX = 0.0;
+        velocityZ = 0.0;
+        rotationX = std::min(1.0, rotationX + deltaSeconds * 2.0);
+        if (keyState[VK_SPACE] && fallElapsed >= 0.8) {
+            fallen = false;
+            fallElapsed = 0.0;
+            grounded = true;
+            rotationX = 0.0;
+        }
+        return;
+    }
+
     double previousX = playerX;
     double previousZ = playerZ;
-    double forward = (keyState[VK_UP] ? 1.0 : 0.0) - (keyState[VK_DOWN] ? 1.0 : 0.0);
-    double strafe = (keyState[VK_RIGHT] ? 1.0 : 0.0) - (keyState[VK_LEFT] ? 1.0 : 0.0);
+    double forward = (keyState['W'] ? 1.0 : 0.0) - (keyState['S'] ? 1.0 : 0.0);
+    double strafe = (keyState['D'] ? 1.0 : 0.0) - (keyState['A'] ? 1.0 : 0.0);
     double length = std::sqrt(forward * forward + strafe * strafe);
     if (length > 0.0) {
         forward /= length;
         strafe /= length;
-        playerX += (std::sin(rotationY) * forward + std::cos(rotationY) * strafe) * configuredMoveSpeed * deltaSeconds;
-        playerZ += (std::cos(rotationY) * forward - std::sin(rotationY) * strafe) * configuredMoveSpeed * deltaSeconds;
+        double accelerationX = (std::sin(rotationY) * forward + std::cos(rotationY) * strafe) * configuredAcceleration;
+        double accelerationZ = (std::cos(rotationY) * forward - std::sin(rotationY) * strafe) * configuredAcceleration;
+        velocityX += accelerationX * deltaSeconds;
+        velocityZ += accelerationZ * deltaSeconds;
+    } else {
+        double speed = std::hypot(velocityX, velocityZ);
+        double reduction = std::min(speed, stopAcceleration * deltaSeconds);
+        if (speed > 0.0) {
+            velocityX -= velocityX / speed * reduction;
+            velocityZ -= velocityZ / speed * reduction;
+        }
     }
+    double horizontalSpeed = std::hypot(velocityX, velocityZ);
+    if (horizontalSpeed > configuredMoveSpeed) {
+        double scale = configuredMoveSpeed / horizontalSpeed;
+        velocityX *= scale;
+        velocityZ *= scale;
+    }
+    playerX += velocityX * deltaSeconds;
+    playerZ += velocityZ * deltaSeconds;
 
-    if (keyState['A']) rotationY -= 1.8 * deltaSeconds;
-    if (keyState['D']) rotationY += 1.8 * deltaSeconds;
-    if (keyState['W']) rotationX = std::max(-1.0, rotationX - 1.4 * deltaSeconds);
-    if (keyState['S']) rotationX = std::min(1.0, rotationX + 1.4 * deltaSeconds);
+    if (keyState[VK_LEFT]) rotationY -= 1.8 * deltaSeconds;
+    if (keyState[VK_RIGHT]) rotationY += 1.8 * deltaSeconds;
+    if (keyState[VK_UP]) rotationX = std::max(-1.0, rotationX - 1.4 * deltaSeconds);
+    if (keyState[VK_DOWN]) rotationX = std::min(1.0, rotationX + 1.4 * deltaSeconds);
     updateFlip(deltaSeconds);
 
     constexpr double PLAYER_RADIUS = 0.35;
@@ -237,20 +286,26 @@ void updateGame(double deltaSeconds) {
         if (playerZ + PLAYER_RADIUS > platformFront && playerZ - PLAYER_RADIUS < platformBack) {
             if (previousX + PLAYER_RADIUS <= platformLeft && playerX + PLAYER_RADIUS > platformLeft) {
                 playerX = platformLeft - PLAYER_RADIUS;
+                velocityX = std::min(0.0, velocityX);
             } else if (previousX - PLAYER_RADIUS >= platformRight && playerX - PLAYER_RADIUS < platformRight) {
                 playerX = platformRight + PLAYER_RADIUS;
+                velocityX = std::max(0.0, velocityX);
             }
         }
         if (playerX + PLAYER_RADIUS > platformLeft && playerX - PLAYER_RADIUS < platformRight) {
             if (previousZ + PLAYER_RADIUS <= platformFront && playerZ + PLAYER_RADIUS > platformFront) {
                 playerZ = platformFront - PLAYER_RADIUS;
+                velocityZ = std::min(0.0, velocityZ);
             } else if (previousZ - PLAYER_RADIUS >= platformBack && playerZ - PLAYER_RADIUS < platformBack) {
                 playerZ = platformBack + PLAYER_RADIUS;
+                velocityZ = std::max(0.0, velocityZ);
             }
         }
     }
 
-    verticalSpeed -= GRAVITY * deltaSeconds;
+    grounded = false;
+    double fallingSpeed = std::max(0.0, -verticalSpeed);
+    verticalSpeed -= configuredGravity * deltaSeconds;
     double previousY = playerY;
     playerY += verticalSpeed * deltaSeconds;
     playerBottom = playerY - playerHeight * 0.5;
@@ -264,6 +319,16 @@ void updateGame(double deltaSeconds) {
         if (verticalSpeed <= 0.0 && previousY - playerHeight * 0.5 >= platformTop && playerBottom <= platformTop) {
             playerY = platformTop + playerHeight * 0.5;
             verticalSpeed = 0.0;
+            double impactForce = playerMass * fallingSpeed / IMPACT_TIME / 9.80665;
+            if (impactForce > receptionCapacity) {
+                fallen = true;
+                fallElapsed = 0.0;
+                rotationX = 1.0;
+                velocityX = 0.0;
+                velocityZ = 0.0;
+            } else {
+                grounded = true;
+            }
         } else if (verticalSpeed > 0.0 && previousY + playerHeight * 0.5 <= platformBottom && playerTop >= platformBottom) {
             playerY = platformBottom - playerHeight * 0.5;
             verticalSpeed = 0.0;
@@ -277,14 +342,20 @@ void updateGame(double deltaSeconds) {
         }
     }
 
-    if (keyState[VK_SPACE] && std::abs(verticalSpeed) < 0.05) {
-        verticalSpeed = configuredJump;
+    if (keyState[VK_SPACE] && grounded) {
+        verticalSpeed = jumpForce * 9.80665 / std::max(1.0, playerMass) * FORCE_APPLICATION_TIME;
+        grounded = false;
     }
     if (playerY < -12.0) {
         playerX = 0.0;
         playerY = 0.35 + playerHeight * 0.5;
         playerZ = 0.0;
+        velocityX = 0.0;
+        velocityZ = 0.0;
         verticalSpeed = 0.0;
+        grounded = true;
+        fallen = false;
+        fallElapsed = 0.0;
     }
 
     double movedFromMapCenter = std::hypot(playerX - lastMapCenterX, playerZ - lastMapCenterZ);
@@ -320,7 +391,13 @@ double cameraDepth(double x, double y, double z) {
     return dy * std::sin(cameraPitch) + camZ * std::cos(cameraPitch);
 }
 
-bool projectPoint(double x, double y, double z, int width, int height, int centerShift, POINT& point, double& depth) {
+struct CameraPoint {
+    double x;
+    double y;
+    double depth;
+};
+
+CameraPoint toCameraPoint(double x, double y, double z) {
     double dx = x - playerX;
     double dy = y - playerY;
     double dz = z - playerZ;
@@ -329,15 +406,41 @@ bool projectPoint(double x, double y, double z, int width, int height, int cente
     double camX = dx * std::cos(cameraYaw) - dz * std::sin(cameraYaw);
     double camZ = dx * std::sin(cameraYaw) + dz * std::cos(cameraYaw);
     double camY = dy * std::cos(cameraPitch) - camZ * std::sin(cameraPitch);
-    depth = dy * std::sin(cameraPitch) + camZ * std::cos(cameraPitch);
-    if (depth <= -5.0) return false;
-    if (depth < 0.2) depth = 0.2;
-    double rolledX = camX * std::cos(flipRoll) - camY * std::sin(flipRoll);
-    double rolledY = camX * std::sin(flipRoll) + camY * std::cos(flipRoll);
+    return {camX, camY, dy * std::sin(cameraPitch) + camZ * std::cos(cameraPitch)};
+}
+
+void clipToNearPlane(std::vector<CameraPoint>& polygon) {
+    constexpr double NEAR_PLANE = 0.2;
+    if (polygon.empty()) return;
+    std::vector<CameraPoint> clipped;
+    CameraPoint previous = polygon.back();
+    bool previousInside = previous.depth >= NEAR_PLANE;
+    for (const CameraPoint& current : polygon) {
+        bool currentInside = current.depth >= NEAR_PLANE;
+        if (currentInside != previousInside) {
+            double denominator = current.depth - previous.depth;
+            double ratio = denominator == 0.0 ? 0.0 : (NEAR_PLANE - previous.depth) / denominator;
+            clipped.push_back({
+                previous.x + (current.x - previous.x) * ratio,
+                previous.y + (current.y - previous.y) * ratio,
+                NEAR_PLANE
+            });
+        }
+        if (currentInside) clipped.push_back(current);
+        previous = current;
+        previousInside = currentInside;
+    }
+    polygon = std::move(clipped);
+}
+
+POINT projectCameraPoint(const CameraPoint& cameraPoint, int width, int height, int centerShift) {
+    double rolledX = cameraPoint.x * std::cos(flipRoll) - cameraPoint.y * std::sin(flipRoll);
+    double rolledY = cameraPoint.x * std::sin(flipRoll) + cameraPoint.y * std::cos(flipRoll);
     double focal = std::min(width, height) * 0.5 / std::tan(fieldOfView * 0.5 * PI / 180.0);
-    point.x = static_cast<LONG>(width / 2.0 + centerShift + rolledX * focal / depth);
-    point.y = static_cast<LONG>(height * 0.52 - rolledY * focal / depth);
-    return true;
+    return {
+        static_cast<LONG>(width / 2.0 + centerShift + rolledX * focal / cameraPoint.depth),
+        static_cast<LONG>(height * 0.52 - rolledY * focal / cameraPoint.depth)
+    };
 }
 
 void drawScene(HDC deviceContext, int panelLeft, int panelWidth, int height, int centerShift) {
@@ -366,63 +469,47 @@ void drawScene(HDC deviceContext, int panelLeft, int panelWidth, int height, int
 
     for (const auto& item : visible) {
         const Platform& platform = platforms[item.second];
-        POINT corners[4]{};
-        POINT bottomCorners[4]{};
-        double depth = 0.0;
-        bool visiblePlatform = projectPoint(platform.x - platform.width / 2, platform.y,
-            platform.z - platform.depth / 2, panelWidth, height, centerShift, corners[0], depth) &&
-            projectPoint(platform.x + platform.width / 2, platform.y,
-            platform.z - platform.depth / 2, panelWidth, height, centerShift, corners[1], depth) &&
-            projectPoint(platform.x + platform.width / 2, platform.y,
-            platform.z + platform.depth / 2, panelWidth, height, centerShift, corners[2], depth) &&
-            projectPoint(platform.x - platform.width / 2, platform.y,
-            platform.z + platform.depth / 2, panelWidth, height, centerShift, corners[3], depth);
-        if (!visiblePlatform) continue;
-        POINT shifted[4] = {
-            {corners[0].x + panelLeft, corners[0].y}, {corners[1].x + panelLeft, corners[1].y},
-            {corners[2].x + panelLeft, corners[2].y}, {corners[3].x + panelLeft, corners[3].y}
+        if (platform.floor) continue;
+        std::vector<CameraPoint> top = {
+            toCameraPoint(platform.x - platform.width / 2, platform.y, platform.z - platform.depth / 2),
+            toCameraPoint(platform.x + platform.width / 2, platform.y, platform.z - platform.depth / 2),
+            toCameraPoint(platform.x + platform.width / 2, platform.y, platform.z + platform.depth / 2),
+            toCameraPoint(platform.x - platform.width / 2, platform.y, platform.z + platform.depth / 2)
         };
-        bool visibleBottom =
-            projectPoint(platform.x - platform.width / 2, platform.y - 0.45,
-                platform.z - platform.depth / 2, panelWidth, height, centerShift, bottomCorners[0], depth) &&
-            projectPoint(platform.x + platform.width / 2, platform.y - 0.45,
-                platform.z - platform.depth / 2, panelWidth, height, centerShift, bottomCorners[1], depth) &&
-            projectPoint(platform.x + platform.width / 2, platform.y - 0.45,
-                platform.z + platform.depth / 2, panelWidth, height, centerShift, bottomCorners[2], depth) &&
-            projectPoint(platform.x - platform.width / 2, platform.y - 0.45,
-                platform.z + platform.depth / 2, panelWidth, height, centerShift, bottomCorners[3], depth);
-        if (!visibleBottom) continue;
-
-        POINT shiftedBottom[4] = {
-            {bottomCorners[0].x + panelLeft, bottomCorners[0].y}, {bottomCorners[1].x + panelLeft, bottomCorners[1].y},
-            {bottomCorners[2].x + panelLeft, bottomCorners[2].y}, {bottomCorners[3].x + panelLeft, bottomCorners[3].y}
+        std::vector<CameraPoint> bottom = {
+            toCameraPoint(platform.x - platform.width / 2, platform.y - 0.45, platform.z - platform.depth / 2),
+            toCameraPoint(platform.x + platform.width / 2, platform.y - 0.45, platform.z - platform.depth / 2),
+            toCameraPoint(platform.x + platform.width / 2, platform.y - 0.45, platform.z + platform.depth / 2),
+            toCameraPoint(platform.x - platform.width / 2, platform.y - 0.45, platform.z + platform.depth / 2)
         };
-        COLORREF sideColor = platform.floor ? RGB(35, 40, 50) : RGB(
+        COLORREF sideColor = RGB(
             GetRValue(platform.color) * 2 / 3,
             GetGValue(platform.color) * 2 / 3,
             GetBValue(platform.color) * 2 / 3);
-        if (!pointLight && !platform.floor) {
+        if (!pointLight) {
             sideColor = RGB(GetRValue(sideColor) / 2, GetGValue(sideColor) / 2, GetBValue(sideColor) / 2);
         }
-        HBRUSH brush = CreateSolidBrush(sideColor);
-        HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(deviceContext, brush));
-        POINT side[4]{};
-        side[0] = shifted[0]; side[1] = shifted[1]; side[2] = shiftedBottom[1]; side[3] = shiftedBottom[0];
-        Polygon(deviceContext, side, 4);
-        side[0] = shifted[1]; side[1] = shifted[2]; side[2] = shiftedBottom[2]; side[3] = shiftedBottom[1];
-        Polygon(deviceContext, side, 4);
-        side[0] = shifted[2]; side[1] = shifted[3]; side[2] = shiftedBottom[3]; side[3] = shiftedBottom[2];
-        Polygon(deviceContext, side, 4);
-        side[0] = shifted[3]; side[1] = shifted[0]; side[2] = shiftedBottom[0]; side[3] = shiftedBottom[3];
-        Polygon(deviceContext, side, 4);
-        SelectObject(deviceContext, oldBrush);
-        DeleteObject(brush);
-
-        brush = CreateSolidBrush(platform.color);
-        oldBrush = static_cast<HBRUSH>(SelectObject(deviceContext, brush));
-        Polygon(deviceContext, shifted, 4);
-        SelectObject(deviceContext, oldBrush);
-        DeleteObject(brush);
+        auto drawFace = [&](std::vector<CameraPoint> face, COLORREF color) {
+            clipToNearPlane(face);
+            if (face.size() < 3) return;
+            std::vector<POINT> projected;
+            projected.reserve(face.size());
+            for (const CameraPoint& point : face) {
+                POINT screenPoint = projectCameraPoint(point, panelWidth, height, centerShift);
+                screenPoint.x += panelLeft;
+                projected.push_back(screenPoint);
+            }
+            HBRUSH brush = CreateSolidBrush(color);
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(deviceContext, brush));
+            Polygon(deviceContext, projected.data(), static_cast<int>(projected.size()));
+            SelectObject(deviceContext, oldBrush);
+            DeleteObject(brush);
+        };
+        drawFace({top[0], top[1], bottom[1], bottom[0]}, sideColor);
+        drawFace({top[1], top[2], bottom[2], bottom[1]}, sideColor);
+        drawFace({top[2], top[3], bottom[3], bottom[2]}, sideColor);
+        drawFace({top[3], top[0], bottom[0], bottom[3]}, sideColor);
+        drawFace(top, platform.color);
     }
 
     RestoreDC(deviceContext, savedState);
@@ -434,12 +521,103 @@ HWND makeMenuButton(HWND parent, const wchar_t* text, int id) {
         GetModuleHandle(nullptr), nullptr);
 }
 
+struct SliderSpec {
+    int maximumPosition;
+};
+
+SliderSpec sliderSpecFor(int optionId) {
+    if (optionId == 3101) return {5};
+    if (optionId == 3111) return {7};
+    if (optionId == 3121 || optionId == 3131 || optionId == 3141) return {15};
+    if (optionId == 3151) return {20};
+    if (optionId == 3201) return {18};
+    if (optionId == 3231) return {7};
+    if (optionId == 3301) return {19};
+    if (optionId == 3321) return {16};
+    if (optionId == 3501) return {39};
+    if (optionId == 3511) return {195};
+    if (optionId == 3521) return {400};
+    if (optionId == 3531) return {895};
+    if (optionId == 3541) return {400};
+    if (optionId == 3551) return {199};
+    return {28};
+}
+
+double menuOptionValue(int optionId) {
+    if (optionId == 3101) return mapRadius;
+    if (optionId == 3111) return platformDensity;
+    if (optionId == 3121) return platformSize;
+    if (optionId == 3131) return platformHeight;
+    if (optionId == 3141) return platformSpacing;
+    if (optionId == 3151) return starCount;
+    if (optionId == 3201) return fieldOfView;
+    if (optionId == 3231) return fpsLimit;
+    if (optionId == 3301) return configuredMoveSpeed;
+    if (optionId == 3321) return playerHeight;
+    if (optionId == 3501) return configuredAcceleration;
+    if (optionId == 3511) return playerMass;
+    if (optionId == 3521) return jumpForce;
+    if (optionId == 3531) return receptionCapacity;
+    if (optionId == 3541) return configuredGravity;
+    if (optionId == 3551) return stopAcceleration;
+    if (optionId == 3421) return mortalSpeed;
+    return twistSpeed;
+}
+
+int sliderPositionFor(int optionId) {
+    double value = menuOptionValue(optionId);
+    if (optionId == 3101) return static_cast<int>(value - 1);
+    if (optionId == 3111) return static_cast<int>(value - 1);
+    if (optionId == 3121 || optionId == 3131 || optionId == 3141) return static_cast<int>((value - 50.0) / 10.0);
+    if (optionId == 3151) return static_cast<int>(value / 50.0);
+    if (optionId == 3201) return static_cast<int>((value - 50.0) / 5.0);
+    if (optionId == 3231) return static_cast<int>((value - 30.0) / 30.0);
+    if (optionId == 3301) return static_cast<int>(value - 1);
+    if (optionId == 3321) return static_cast<int>((value - 1.40) / 0.05);
+    if (optionId == 3501) return static_cast<int>(value - 1.0);
+    if (optionId == 3511) return static_cast<int>(value - 5.0);
+    if (optionId == 3521) return static_cast<int>(value);
+    if (optionId == 3531) return static_cast<int>(value - 5.0);
+    if (optionId == 3541) return static_cast<int>(value * 10.0);
+    if (optionId == 3551) return static_cast<int>((value - 0.1) * 10.0);
+    return static_cast<int>((value - 0.1) / 0.05);
+}
+
+double sliderValueFor(int optionId, int position) {
+    if (optionId == 3101 || optionId == 3111) return position + 1.0;
+    if (optionId == 3121 || optionId == 3131 || optionId == 3141) return 50.0 + position * 10.0;
+    if (optionId == 3151) return position * 50.0;
+    if (optionId == 3201) return 50.0 + position * 5.0;
+    if (optionId == 3231) return 30.0 + position * 30.0;
+    if (optionId == 3301) return position + 1.0;
+    if (optionId == 3321) return 1.40 + position * 0.05;
+    if (optionId == 3501) return 1.0 + position;
+    if (optionId == 3511) return 5.0 + position;
+    if (optionId == 3521) return position;
+    if (optionId == 3531) return 5.0 + position;
+    if (optionId == 3541) return position * 0.1;
+    if (optionId == 3551) return 0.1 + position * 0.1;
+    return 0.1 + position * 0.05;
+}
+
 void addMenuOption(HWND parent, int page, const wchar_t* title, int minusId, int plusId) {
     HWND label = CreateWindow(L"STATIC", title, WS_CHILD | SS_CENTER,
         0, 0, 180, 30, parent, nullptr, GetModuleHandle(nullptr), nullptr);
-    HWND minusButton = makeMenuButton(parent, L"-", minusId);
-    HWND plusButton = makeMenuButton(parent, L"+", plusId);
-    menuOptions.push_back({page, minusId, plusId, label, minusButton, plusButton});
+    HWND slider = CreateWindowEx(
+        0,
+        TRACKBAR_CLASS,
+        title,
+        WS_CHILD | TBS_AUTOTICKS,
+        0, 0, 180, 34,
+        parent,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(minusId)),
+        GetModuleHandle(nullptr),
+        nullptr);
+    SliderSpec spec = sliderSpecFor(minusId);
+    SendMessage(slider, TBM_SETRANGE, TRUE, MAKELONG(0, spec.maximumPosition));
+    SendMessage(slider, TBM_SETLINESIZE, TRUE, 1);
+    SendMessage(slider, TBM_SETPOS, TRUE, sliderPositionFor(minusId));
+    menuOptions.push_back({page, minusId, plusId, label, slider});
 }
 
 void updateMenuLabels() {
@@ -459,7 +637,6 @@ void updateMenuLabels() {
             if (option.minusId == 3231) { name = L"FPS limit"; value = fpsLimit; }
         } else if (option.page == 3) {
             if (option.minusId == 3301) { name = L"Speed m/s"; value = configuredMoveSpeed; }
-            if (option.minusId == 3311) { name = L"Jump m"; value = configuredJump; }
             if (option.minusId == 3321) {
                 swprintf_s(text, L"Height: %.2f m", playerHeight);
                 SetWindowText(option.label, text);
@@ -467,12 +644,43 @@ void updateMenuLabels() {
             }
         } else if (option.page == 4) {
             if (option.minusId == 3421) {
-                swprintf_s(text, L"Mortal speed: %.1f", mortalSpeed);
+                swprintf_s(text, L"Mortal speed: %.2f", mortalSpeed);
                 SetWindowText(option.label, text);
                 continue;
             }
             if (option.minusId == 3431) {
-                swprintf_s(text, L"Twist speed: %.1f", twistSpeed);
+                swprintf_s(text, L"Twist speed: %.2f", twistSpeed);
+                SetWindowText(option.label, text);
+                continue;
+            }
+        } else if (option.page == 5) {
+            if (option.minusId == 3501) {
+                swprintf_s(text, L"Acceleration: %.1f m/s2", configuredAcceleration);
+                SetWindowText(option.label, text);
+                continue;
+            }
+            if (option.minusId == 3511) {
+                swprintf_s(text, L"Mass: %.0f kg", playerMass);
+                SetWindowText(option.label, text);
+                continue;
+            }
+            if (option.minusId == 3521) {
+                swprintf_s(text, L"Jump force: %.0f kgf", jumpForce);
+                SetWindowText(option.label, text);
+                continue;
+            }
+            if (option.minusId == 3531) {
+                swprintf_s(text, L"Landing capacity: %.0f kgf", receptionCapacity);
+                SetWindowText(option.label, text);
+                continue;
+            }
+            if (option.minusId == 3541) {
+                swprintf_s(text, L"Gravity: %.1f m/s2", configuredGravity);
+                SetWindowText(option.label, text);
+                continue;
+            }
+            if (option.minusId == 3551) {
+                swprintf_s(text, L"Stop acceleration: %.1f m/s2", stopAcceleration);
                 SetWindowText(option.label, text);
                 continue;
             }
@@ -493,14 +701,14 @@ void showMenuPage(int page) {
     ShowWindow(graphicsButton, page == 0 && paused ? SW_SHOW : SW_HIDE);
     ShowWindow(playerButton, page == 0 && paused ? SW_SHOW : SW_HIDE);
     ShowWindow(flipsButton, page == 0 && paused ? SW_SHOW : SW_HIDE);
+    ShowWindow(physicsButton, page == 0 && paused ? SW_SHOW : SW_HIDE);
     ShowWindow(backButton, page != 0 && paused ? SW_SHOW : SW_HIDE);
     ShowWindow(pointLightButton, page == 2 && paused ? SW_SHOW : SW_HIDE);
     ShowWindow(showFpsButton, page == 2 && paused ? SW_SHOW : SW_HIDE);
     for (const MenuOption& option : menuOptions) {
         bool visible = paused && page == option.page;
         ShowWindow(option.label, visible ? SW_SHOW : SW_HIDE);
-        ShowWindow(option.minusButton, visible ? SW_SHOW : SW_HIDE);
-        ShowWindow(option.plusButton, visible ? SW_SHOW : SW_HIDE);
+        ShowWindow(option.slider, visible ? SW_SHOW : SW_HIDE);
     }
     updateMenuLabels();
     if (gameWindow) InvalidateRect(gameWindow, nullptr, FALSE);
@@ -523,7 +731,6 @@ void adjustMenuOption(int commandId) {
     if (commandId == 3201 || commandId == 3202) fieldOfView = std::clamp(fieldOfView + direction * 5, 50, 140);
     if (commandId == 3231 || commandId == 3232) fpsLimit = std::clamp(fpsLimit + direction * 30, 30, 240);
     if (commandId == 3301 || commandId == 3302) configuredMoveSpeed = std::clamp(configuredMoveSpeed + direction, 1, 20);
-    if (commandId == 3311 || commandId == 3312) configuredJump = std::clamp(configuredJump + direction, 1, 20);
     if (commandId == 3321 || commandId == 3322) {
         playerHeight = std::clamp(playerHeight + direction * 0.05, 1.40, 2.20);
             if (gameWindow) {
@@ -532,26 +739,62 @@ void adjustMenuOption(int commandId) {
         }
     }
     if (commandId == 3421 || commandId == 3422) {
-        mortalSpeed = std::clamp(mortalSpeed + direction * 0.1, 0.5, 1.1);
+        mortalSpeed = std::clamp(mortalSpeed + direction * 0.05, 0.1, 1.5);
             if (activeFlipMask != 0) flipDuration = 1.0 / mortalSpeed;
     }
     if (commandId == 3431 || commandId == 3432) {
-        twistSpeed = std::clamp(twistSpeed + direction * 0.1, 0.5, 1.1);
+        twistSpeed = std::clamp(twistSpeed + direction * 0.05, 0.1, 1.5);
             if (activeFlipMask != 0) flipDuration = 1.0 / twistSpeed;
     }
     if (commandId >= 3101 && commandId <= 3152) resetGame();
     updateMenuLabels();
     if ((commandId == 3231 || commandId == 3232) && gameWindow) {
-        SetTimer(gameWindow, 1, std::max(1, 1000 / fpsLimit), nullptr);
+        SetTimer(gameWindow, 1, std::max(1, static_cast<int>(std::ceil(1000.0 / fpsLimit))), nullptr);
     }
     if (gameWindow) InvalidateRect(gameWindow, nullptr, FALSE);
 }
 
+void setMenuOptionFromSlider(int commandId, int position) {
+    double value = sliderValueFor(commandId, position);
+    if (commandId == 3101) mapRadius = static_cast<int>(value);
+    if (commandId == 3111) platformDensity = static_cast<int>(value);
+    if (commandId == 3121) platformSize = static_cast<int>(value);
+    if (commandId == 3131) platformHeight = static_cast<int>(value);
+    if (commandId == 3141) platformSpacing = static_cast<int>(value);
+    if (commandId == 3151) starCount = static_cast<int>(value);
+    if (commandId == 3201) fieldOfView = static_cast<int>(value);
+    if (commandId == 3231) fpsLimit = static_cast<int>(value);
+    if (commandId == 3301) configuredMoveSpeed = static_cast<int>(value);
+    if (commandId == 3321) {
+        playerHeight = value;
+        playerY = 0.35 + playerHeight * 0.5;
+        verticalSpeed = 0.0;
+    }
+    if (commandId == 3421) mortalSpeed = value;
+    if (commandId == 3431) twistSpeed = value;
+    if (commandId == 3501) configuredAcceleration = value;
+    if (commandId == 3511) playerMass = value;
+    if (commandId == 3521) jumpForce = value;
+    if (commandId == 3531) receptionCapacity = value;
+    if (commandId == 3541) configuredGravity = value;
+    if (commandId == 3551) stopAcceleration = value;
+    if (commandId == 3421 || commandId == 3431) {
+        if (activeFlipMask != 0) flipDuration = 1.0 / value;
+    }
+    if (commandId >= 3101 && commandId <= 3151) resetGame();
+    if (commandId == 3231 && gameWindow) {
+        SetTimer(gameWindow, 1, std::max(1, static_cast<int>(std::ceil(1000.0 / fpsLimit))), nullptr);
+    }
+    updateMenuLabels();
+    if (gameWindow) InvalidateRect(gameWindow, nullptr, FALSE);
+}
+
 int menuHeightForPage(int page) {
-    if (page == 1) return 310;
+    if (page == 1) return 500;
     if (page == 2) return 230;
     if (page == 3) return 230;
     if (page == 4) return 230;
+    if (page == 5) return 500;
     return 170;
 }
 
@@ -568,22 +811,22 @@ void layoutMenuControls(int width, int height) {
     MoveWindow(resumeButton, center - 150, rootTop, 90, 34, TRUE);
     MoveWindow(restartButton, center - 45, rootTop, 90, 34, TRUE);
     MoveWindow(exitButton, center + 60, rootTop, 90, 34, TRUE);
-    MoveWindow(mapButton, center - 210, rootTop + 48, 95, 32, TRUE);
-    MoveWindow(graphicsButton, center - 105, rootTop + 48, 95, 32, TRUE);
-    MoveWindow(playerButton, center, rootTop + 48, 95, 32, TRUE);
-    MoveWindow(flipsButton, center + 105, rootTop + 48, 95, 32, TRUE);
+    MoveWindow(flipsButton, center + 46, rootTop + 48, 82, 32, TRUE);
+    MoveWindow(physicsButton, center + 134, rootTop + 48, 82, 32, TRUE);
+    MoveWindow(mapButton, center - 216, rootTop + 48, 82, 32, TRUE);
+    MoveWindow(graphicsButton, center - 128, rootTop + 48, 82, 32, TRUE);
+    MoveWindow(playerButton, center - 40, rootTop + 48, 82, 32, TRUE);
     MoveWindow(backButton, center - 45, menuTop + 8, 90, 32, TRUE);
     MoveWindow(pointLightButton, center - 160, menuTop + 48, 120, 32, TRUE);
     MoveWindow(showFpsButton, center + 40, menuTop + 48, 120, 32, TRUE);
 
     int optionIndex = 0;
-    int optionTop = menuTop + ((menuPage == 2) ? 90 : 48);
+    int optionTop = menuTop + 48;
     for (const MenuOption& option : menuOptions) {
         if (option.page != menuPage) continue;
-        int y = optionTop + optionIndex++ * 38;
+        int y = optionTop + optionIndex++ * 72;
         MoveWindow(option.label, center - 90, y, 180, 30, TRUE);
-        MoveWindow(option.minusButton, center - 145, y, 45, 30, TRUE);
-        MoveWindow(option.plusButton, center + 100, y, 45, 30, TRUE);
+        MoveWindow(option.slider, center - 110, y + 30, 220, 34, TRUE);
     }
 }
 
@@ -598,7 +841,8 @@ void drawPausePanel(HDC deviceContext, int panelLeft, int panelWidth, int render
     SetBkMode(deviceContext, TRANSPARENT);
     SetTextColor(deviceContext, RGB(255, 255, 255));
     const wchar_t* title = menuPage == 0 ? L"PAUSED" :
-        (menuPage == 1 ? L"MAPA" : menuPage == 2 ? L"GRAFICOS" : menuPage == 3 ? L"JUGADOR" : L"MORTALES");
+        (menuPage == 1 ? L"MAPA" : menuPage == 2 ? L"GRAFICOS" :
+        menuPage == 3 ? L"JUGADOR" : menuPage == 4 ? L"MORTALES" : L"FISICA");
     RECT titleRect{pausePanel.left, pausePanel.top + 8, pausePanel.right, pausePanel.top + 36};
     DrawText(deviceContext, title, -1, &titleRect, DT_CENTER | DT_TOP);
 }
@@ -650,6 +894,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         graphicsButton = makeMenuButton(window, L"Graficos", BUTTON_GRAPHICS);
         playerButton = makeMenuButton(window, L"Jugador", BUTTON_PLAYER);
         flipsButton = makeMenuButton(window, L"Mortales", BUTTON_FLIPS);
+        physicsButton = makeMenuButton(window, L"Fisica", BUTTON_PHYSICS);
         backButton = makeMenuButton(window, L"Back", BUTTON_BACK);
         pointLightButton = makeMenuButton(window, L"Point Light", BUTTON_POINT_LIGHT);
         showFpsButton = makeMenuButton(window, L"Show FPS", BUTTON_SHOW_FPS);
@@ -663,10 +908,15 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         addMenuOption(window, 2, L"FOV", 3201, 3202);
         addMenuOption(window, 2, L"FPS limit", 3231, 3232);
         addMenuOption(window, 3, L"Speed m/s", 3301, 3302);
-        addMenuOption(window, 3, L"Jump m", 3311, 3312);
         addMenuOption(window, 3, L"Height", 3321, 3322);
         addMenuOption(window, 4, L"Mortal speed", 3421, 3422);
         addMenuOption(window, 4, L"Twist speed", 3431, 3432);
+        addMenuOption(window, 5, L"Acceleration", 3501, 3502);
+        addMenuOption(window, 5, L"Mass", 3511, 3512);
+        addMenuOption(window, 5, L"Jump force", 3521, 3522);
+        addMenuOption(window, 5, L"Landing capacity", 3531, 3532);
+        addMenuOption(window, 5, L"Gravity", 3541, 3542);
+        addMenuOption(window, 5, L"Stop acceleration", 3551, 3552);
         showMenuPage(0);
         return 0;
     }
@@ -726,7 +976,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
     }
     case WM_KEYDOWN:
-        if (!keyState[wParam < 256 ? wParam : 0]) {
+        if (!paused && !keyState[wParam < 256 ? wParam : 0]) {
             if (wParam == VK_NUMPAD8) startFlip(FlipKind::Front);
             if (wParam == VK_NUMPAD2) startFlip(FlipKind::Back);
             if (wParam == VK_NUMPAD4) startFlip(FlipKind::TwistLeft);
@@ -743,6 +993,14 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         return 0;
     case WM_KEYUP:
         if (wParam < 256) keyState[wParam] = false;
+        return 0;
+    case WM_KILLFOCUS:
+    case WM_ACTIVATEAPP:
+        if (message == WM_KILLFOCUS || !wParam) {
+            std::fill(std::begin(keyState), std::end(keyState), false);
+            dragging = false;
+            if (GetCapture() == window) ReleaseCapture();
+        }
         return 0;
     case WM_TIMER: {
         ULONGLONG now = GetTickCount64();
@@ -764,6 +1022,17 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             eyeDistance = static_cast<int>(SendMessage(eyeDistanceSlider, TBM_GETPOS, 0, 0));
             InvalidateRect(window, nullptr, FALSE);
             SetFocus(window);
+        }
+        if (reinterpret_cast<HWND>(lParam) != eyeDistanceSlider) {
+            HWND slider = reinterpret_cast<HWND>(lParam);
+            int commandId = GetDlgCtrlID(slider);
+            for (const MenuOption& option : menuOptions) {
+                if (option.slider == slider) {
+                    setMenuOptionFromSlider(commandId, static_cast<int>(SendMessage(slider, TBM_GETPOS, 0, 0)));
+                    break;
+                }
+            }
+            if (LOWORD(wParam) == TB_ENDTRACK) SetFocus(window);
         }
         return 0;
     case WM_COMMAND:
@@ -794,6 +1063,9 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         case BUTTON_FLIPS:
             showMenuPage(4);
             return 0;
+        case BUTTON_PHYSICS:
+            showMenuPage(5);
+            return 0;
         case BUTTON_BACK:
             showMenuPage(0);
             return 0;
@@ -806,7 +1078,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             SetWindowText(showFpsButton, showFps ? L"Show FPS: ON" : L"Show FPS: OFF");
             return 0;
         default:
-            if (LOWORD(wParam) >= 3101 && LOWORD(wParam) <= 3412) {
+            if (LOWORD(wParam) >= 3101 && LOWORD(wParam) <= 3432) {
                 adjustMenuOption(LOWORD(wParam));
             }
             break;
@@ -829,7 +1101,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         if (dragging) {
             POINT currentMouse{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             rotationY += (currentMouse.x - lastMouse.x) * 0.01;
-            rotationX += (currentMouse.y - lastMouse.y) * 0.01;
+            rotationX = std::clamp(rotationX + (currentMouse.y - lastMouse.y) * 0.01, -1.0, 1.0);
             lastMouse = currentMouse;
             InvalidateRect(window, nullptr, FALSE);
         }
@@ -867,10 +1139,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     RegisterClass(&windowClass);
 
     HWND window = CreateWindowEx(
-        0,
+        WS_EX_COMPOSITED,
         className,
         L"Esfera de motas clickable",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         900,
@@ -892,7 +1164,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     ShowWindow(restartButton, SW_HIDE);
     ShowWindow(exitButton, SW_HIDE);
     showMenuPage(0);
-    SetTimer(window, 1, std::max(1, 1000 / fpsLimit), nullptr);
+    SetTimer(window, 1, std::max(1, static_cast<int>(std::ceil(1000.0 / fpsLimit))), nullptr);
     SetFocus(window);
 
     MSG message{};
